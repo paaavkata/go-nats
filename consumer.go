@@ -34,35 +34,45 @@ type Consumer struct {
 
 // ConsumerConfig holds the configuration for consumers.
 type ConsumerConfig struct {
-	URLs             []string
-	GroupID          string   // durable consumer name (one per consuming service)
-	Topics           []string // each topic is its own stream
-	AutoOffsetReset  string   // "earliest" (default) or "latest" — applies on first creation only
-	MaxDeliver       int      // max delivery attempts before the server stops redelivering
-	AckWait          time.Duration
-	RetryBackoff     time.Duration // Nak delay after a handler error
-	EnableAutoCommit bool          // kept for go-kafka API compat; acks are always explicit
-	Stream           StreamConfig  // used only when a stream does not exist yet
-	TLS              *TLSConfig
-	Auth             *AuthConfig
+	URLs              []string
+	GroupID           string   // durable consumer name (one per consuming service)
+	Topics            []string // each topic is its own stream
+	AutoOffsetReset   string   // "earliest" (default) or "latest" — applies on first creation only
+	MaxDeliver        int      // max delivery attempts before the server stops redelivering
+	AckWait           time.Duration
+	RetryBackoff      time.Duration // Nak delay after a handler error
+	EnableAutoCommit  bool          // kept for go-kafka API compat; acks are always explicit
+	Stream            StreamConfig  // used only when a stream does not exist yet
+	TLS               *TLSConfig
+	Auth              *AuthConfig
+	// InactiveThreshold instructs the NATS server to auto-delete a durable
+	// consumer after it has had no active subscription for this duration.
+	// Zero (default) preserves current behaviour: the server never
+	// auto-deletes the consumer.  Set to e.g. 24h for per-pod durables so
+	// that consumers left behind by pod restarts/deploys are cleaned up
+	// automatically.  This field is wired on first consumer creation only;
+	// existing durables are not updated (JetStream reuse path, line ~189).
+	InactiveThreshold time.Duration
 }
 
 // NewConsumerConfigFromViper creates a consumer configuration from Viper.
 //
 // Keys: nats.urls, nats.consumer.{group_id,topics,auto_offset_reset,
-// max_deliver,ack_wait,retry_backoff}, nats.stream.*, nats.tls.*, nats.auth.*
+// max_deliver,ack_wait,retry_backoff,inactive_threshold}, nats.stream.*,
+// nats.tls.*, nats.auth.*
 func NewConsumerConfigFromViper() *ConsumerConfig {
 	config := &ConsumerConfig{
-		URLs:            viper.GetStringSlice("nats.urls"),
-		GroupID:         viper.GetString("nats.consumer.group_id"),
-		Topics:          viper.GetStringSlice("nats.consumer.topics"),
-		AutoOffsetReset: viper.GetString("nats.consumer.auto_offset_reset"),
-		MaxDeliver:      viper.GetInt("nats.consumer.max_deliver"),
-		AckWait:         viper.GetDuration("nats.consumer.ack_wait"),
-		RetryBackoff:    viper.GetDuration("nats.consumer.retry_backoff"),
-		Stream:          streamConfigFromViper(),
-		TLS:             tlsConfigFromViper(),
-		Auth:            authConfigFromViper(),
+		URLs:              viper.GetStringSlice("nats.urls"),
+		GroupID:           viper.GetString("nats.consumer.group_id"),
+		Topics:            viper.GetStringSlice("nats.consumer.topics"),
+		AutoOffsetReset:   viper.GetString("nats.consumer.auto_offset_reset"),
+		MaxDeliver:        viper.GetInt("nats.consumer.max_deliver"),
+		AckWait:           viper.GetDuration("nats.consumer.ack_wait"),
+		RetryBackoff:      viper.GetDuration("nats.consumer.retry_backoff"),
+		InactiveThreshold: viper.GetDuration("nats.consumer.inactive_threshold"),
+		Stream:            streamConfigFromViper(),
+		TLS:               tlsConfigFromViper(),
+		Auth:              authConfigFromViper(),
 	}
 	applyConsumerDefaults(config)
 	return config
@@ -200,12 +210,13 @@ func (c *Consumer) ensureConsumer(ctx context.Context, topic string) (jetstream.
 	}
 
 	cons, err = c.js.CreateConsumer(ctx, streamName, jetstream.ConsumerConfig{
-		Durable:       durable,
-		FilterSubject: topic,
-		DeliverPolicy: deliverPolicy,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       c.config.AckWait,
-		MaxDeliver:    c.config.MaxDeliver,
+		Durable:           durable,
+		FilterSubject:     topic,
+		DeliverPolicy:     deliverPolicy,
+		AckPolicy:         jetstream.AckExplicitPolicy,
+		AckWait:           c.config.AckWait,
+		MaxDeliver:        c.config.MaxDeliver,
+		InactiveThreshold: c.config.InactiveThreshold,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create consumer %q on stream %q: %w", durable, streamName, err)
