@@ -35,8 +35,12 @@ const (
 	DefaultConnectTimeout = 5 * time.Second
 	DefaultReconnectWait  = 2 * time.Second
 
-	DefaultStreamMaxAge   = 7 * 24 * time.Hour
-	DefaultStreamMaxBytes = 1 << 30 // 1 GiB per stream — dev-friendly cap
+	DefaultStreamMaxAge = 7 * 24 * time.Hour
+	// 256 MiB per stream. Keep this well below the JetStream max_file_store
+	// headroom: every stream ensure reserves MaxBytes up front, and a request
+	// larger than the remaining reservation fails server-side with err 10047
+	// ("insufficient storage resources") even when the stream already exists.
+	DefaultStreamMaxBytes = 1 << 28
 	DefaultStreamReplicas = 1
 )
 
