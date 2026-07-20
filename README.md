@@ -37,7 +37,7 @@ order); different topics are consumed concurrently.
 
 ### Stream creation (used only when a stream doesn't exist yet)
 - `nats.stream.max_age`: retention window (default: `168h`)
-- `nats.stream.max_bytes`: size cap per stream (default: 256 MiB; reserved up front against the server's `max_file_store`, so keep the fleet-wide sum below it)
+- `nats.stream.max_bytes`: size cap per stream (default: 128 MiB; reserved up front against the server's `max_file_store`, so keep the fleet-wide sum below it)
 - `nats.stream.replicas`: JetStream replicas (default: 1; use 3 in prod)
 
 ### Producer
