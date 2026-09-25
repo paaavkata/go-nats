@@ -17,8 +17,12 @@ mostly an import + config-key swap.
 | Partition / offset         | Always `0` / stream sequence (in `Message`)           |
 
 Streams are created **idempotently** by both producers and consumers, so
-service startup order doesn't matter. Existing streams are never modified —
-externally managed configuration wins.
+service startup order doesn't matter. Existing streams keep their
+configuration — externally managed configuration wins — with one exception:
+missing app-scoped subjects (`<base>.*`) are **added** (never removed). A
+replica-count mismatch on an existing stream is **tolerated and logged**, never
+changed; scale existing streams operationally
+(`nats stream edit <name> --replicas 3`).
 
 ## Delivery semantics
 
@@ -38,7 +42,13 @@ order); different topics are consumed concurrently.
 ### Stream creation (used only when a stream doesn't exist yet)
 - `nats.stream.max_age`: retention window (default: `168h`)
 - `nats.stream.max_bytes`: size cap per stream (default: 128 MiB; reserved up front against the server's `max_file_store`, so keep the fleet-wide sum below it)
-- `nats.stream.replicas`: JetStream replicas (default: 1; use 3 in prod)
+- `nats.stream.replicas` / `StreamConfig.Replicas`: explicit replicas. When
+  zero (the norm), resolved from env: `NATS_STREAM_REPLICAS` if set (1..5;
+  invalid values are logged and ignored), else `3` when `ENV=prod`, else `1`.
+  `ENV` is stamped on every pod by the service helm chart.
+
+Operational log lines (subjects added, replica mismatch) go through the
+standard `log` package unless `gonats.SetLogger(logger.Infof)` is called.
 
 ### Producer
 - `nats.topic`: topic to produce to
@@ -85,6 +95,38 @@ err = consumer.ConsumeMessages(ctx, func(msg *gonats.Message) error {
     // return nil to ack; return error to redeliver after RetryBackoff
     return process(msg.Value)
 })
+```
+
+## App-scoped subjects
+
+`job`, `job-status-updates`, `job-status-changed`, `audit-events` and
+`send-email` (`gonats.AppScopedTopics`) are published per app on
+`<base>.<app_id>`. The stream stays one per base (same name as before) with
+subjects `[<base>, <base>.*]`, so legacy flat and scoped messages share it.
+Other topics stay flat unless a producer sets `AppScoped: true` / a consumer
+uses a scoped subscription.
+
+| Mode      | How                                   | Durable(s)                   | Filter            |
+|-----------|---------------------------------------|------------------------------|-------------------|
+| legacy    | `ConsumerConfig.Topics`               | `<group>`                    | `<base>`          |
+| one app   | `gonats.SubscribeApp(base, appID)`    | `<group>_<appID>`            | `<base>.<appID>`  |
+| all apps  | `gonats.SubscribeAllApps(base)`       | `<group>` + `<group>__all`   | `<base>` + `<base>.*` |
+
+All-apps is two durables, not one with two filter subjects: widening the
+legacy durable in place would skip scoped messages it already scanned past
+(verified against nats 2.11), and a new two-filter durable would replay the
+legacy backlog. `Message.Topic` is always the base; `Message.Subject` /
+`Message.AppID` carry the concrete subject and its app (`""` = legacy flat).
+
+```go
+// producer (stream already scoped for AppScopedTopics bases)
+p, _ := gonats.NewProducer(&gonats.ProducerConfig{URLs: urls, ClientID: "conversion-service", Topic: "job"})
+err := p.SendScoped(ctx, appID, "", payload)                 // -> job.<appID>
+err = p.SendScopedWithMsgID(ctx, appID, key, eventUID, ev)   // + Nats-Msg-Id dedup
+
+// consumer: one app / all apps
+c, _ := gonats.NewConsumer(&gonats.ConsumerConfig{URLs: urls, GroupID: "svc-group",
+    Subscriptions: []gonats.TopicSubscription{gonats.SubscribeAllApps("job")}})
 ```
 
 ## Migration notes (from go-kafka)

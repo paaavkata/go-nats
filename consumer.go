@@ -30,21 +30,129 @@ type Consumer struct {
 	nc     *nats.Conn
 	js     jetstream.JetStream
 	config *ConsumerConfig
+	subs   []subscription
+}
+
+// TopicSubscription selects which subjects of one base topic a consumer reads.
+// Build it with SubscribeApp or SubscribeAllApps; the zero mode (neither AppID
+// nor AllApps) is the legacy flat-subject subscription, identical to listing
+// the topic in ConsumerConfig.Topics.
+type TopicSubscription struct {
+	Topic   string // base topic == stream (never "<base>.<app>")
+	AppID   string // non-empty: only "<Topic>.<AppID>"
+	AllApps bool   // "<Topic>" and every "<Topic>.<app>"
+}
+
+// SubscribeApp consumes only app appID's messages on base: one durable
+// "<group>_<appID>" filtered on "<base>.<appID>". Legacy flat-subject
+// messages are NOT delivered to it.
+func SubscribeApp(base, appID string) TopicSubscription {
+	return TopicSubscription{Topic: base, AppID: appID}
+}
+
+// SubscribeAllApps consumes every app's messages on base plus legacy
+// flat-subject ones, through TWO durables on the same stream:
+//
+//	"<group>"       filter "<base>"    the legacy durable, reused untouched
+//	"<group>__all"  filter "<base>.*"  new; DeliverPolicy from AutoOffsetReset
+//
+// Why not one durable with two filter subjects: widening the legacy durable
+// in place does not rewind it, so "<base>.<app>" messages it already scanned
+// past (published before the widening) are silently skipped; and a NEW
+// durable over both subjects would replay the retained legacy backlog. Two
+// durables have neither problem: the legacy one keeps its ack floor, and the
+// scoped one (with the default "earliest") picks up every retained scoped
+// message regardless of whether producers or consumers deploy first.
+// Ordering between legacy and scoped messages is not preserved (they are
+// consumed concurrently, like two topics).
+func SubscribeAllApps(base string) TopicSubscription {
+	return TopicSubscription{Topic: base, AllApps: true}
+}
+
+// subscription is one resolved durable consumer on one stream.
+type subscription struct {
+	topic   string // base topic == stream subject base
+	stream  string // stream name
+	durable string // durable consumer name
+	filter  string // consumer filter subject
+	scoped  bool   // stream must capture "<topic>.*"
+}
+
+// resolveSubscriptions turns Topics (legacy) and Subscriptions into the
+// concrete per-stream durables, rejecting invalid or colliding entries.
+func resolveSubscriptions(config *ConsumerConfig) ([]subscription, error) {
+	all := make([]TopicSubscription, 0, len(config.Topics)+len(config.Subscriptions))
+	for _, t := range config.Topics {
+		all = append(all, TopicSubscription{Topic: t})
+	}
+	all = append(all, config.Subscriptions...)
+
+	var subs []subscription
+	seen := make(map[string]bool, len(all))
+	add := func(sub subscription) error {
+		key := sub.stream + "/" + sub.durable
+		if seen[key] {
+			return fmt.Errorf("duplicate subscription: durable %q on stream %q (topic %q listed twice, or legacy and all-apps on the same topic)",
+				sub.durable, sub.stream, sub.topic)
+		}
+		seen[key] = true
+		subs = append(subs, sub)
+		return nil
+	}
+
+	for _, ts := range all {
+		if ts.Topic == "" {
+			return nil, fmt.Errorf("subscription topic is required")
+		}
+		base := subscription{topic: ts.Topic, stream: StreamName(ts.Topic)}
+		var resolved []subscription
+		switch {
+		case ts.AppID != "" && ts.AllApps:
+			return nil, fmt.Errorf("subscription on %q: AppID and AllApps are mutually exclusive", ts.Topic)
+		case ts.AppID != "":
+			subject, err := ScopedSubject(ts.Topic, ts.AppID)
+			if err != nil {
+				return nil, err
+			}
+			app := base
+			app.durable, app.filter, app.scoped = DurableName(config.GroupID, ts.AppID), subject, true
+			resolved = []subscription{app}
+		case ts.AllApps:
+			if err := validateBaseTopic(ts.Topic); err != nil {
+				return nil, err
+			}
+			legacy := base
+			legacy.durable, legacy.filter, legacy.scoped = DurableName(config.GroupID, ""), ts.Topic, true
+			scoped := base
+			scoped.durable, scoped.filter, scoped.scoped = AllAppsDurableName(config.GroupID), ts.Topic+".*", true
+			resolved = []subscription{legacy, scoped}
+		default:
+			legacy := base
+			legacy.durable, legacy.filter = DurableName(config.GroupID, ""), ts.Topic
+			resolved = []subscription{legacy}
+		}
+		for _, sub := range resolved {
+			if err := add(sub); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return subs, nil
 }
 
 // ConsumerConfig holds the configuration for consumers.
 type ConsumerConfig struct {
-	URLs              []string
-	GroupID           string   // durable consumer name (one per consuming service)
-	Topics            []string // each topic is its own stream
-	AutoOffsetReset   string   // "earliest" (default) or "latest" — applies on first creation only
-	MaxDeliver        int      // max delivery attempts before the server stops redelivering
-	AckWait           time.Duration
-	RetryBackoff      time.Duration // Nak delay after a handler error
-	EnableAutoCommit  bool          // kept for go-kafka API compat; acks are always explicit
-	Stream            StreamConfig  // used only when a stream does not exist yet
-	TLS               *TLSConfig
-	Auth              *AuthConfig
+	URLs             []string
+	GroupID          string   // durable consumer name (one per consuming service)
+	Topics           []string // legacy flat-subject topics; each topic is its own stream
+	AutoOffsetReset  string   // "earliest" (default) or "latest" — applies on first creation only
+	MaxDeliver       int      // max delivery attempts before the server stops redelivering
+	AckWait          time.Duration
+	RetryBackoff     time.Duration // Nak delay after a handler error
+	EnableAutoCommit bool          // kept for go-kafka API compat; acks are always explicit
+	Stream           StreamConfig  // used only when a stream does not exist yet
+	TLS              *TLSConfig
+	Auth             *AuthConfig
 	// InactiveThreshold instructs the NATS server to auto-delete a durable
 	// consumer after it has had no active subscription for this duration.
 	// Zero (default) preserves current behaviour: the server never
@@ -53,6 +161,9 @@ type ConsumerConfig struct {
 	// automatically.  This field is wired on first consumer creation only;
 	// existing durables are not updated (JetStream reuse path, line ~189).
 	InactiveThreshold time.Duration
+	// Subscriptions adds app-scoped subscriptions (SubscribeApp /
+	// SubscribeAllApps); may be combined with Topics for other streams.
+	Subscriptions []TopicSubscription
 }
 
 // NewConsumerConfigFromViper creates a consumer configuration from Viper.
@@ -111,8 +222,12 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 		applyConsumerDefaults(config)
 	}
 
-	if len(config.Topics) == 0 {
+	if len(config.Topics) == 0 && len(config.Subscriptions) == 0 {
 		return nil, fmt.Errorf("at least one topic is required")
+	}
+	subs, err := resolveSubscriptions(config)
+	if err != nil {
+		return nil, fmt.Errorf("invalid consumer config: %w", err)
 	}
 
 	nc, err := connect(config.URLs, config.GroupID, config.TLS, config.Auth)
@@ -130,6 +245,7 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 		nc:     nc,
 		js:     js,
 		config: config,
+		subs:   subs,
 	}, nil
 }
 
@@ -142,7 +258,7 @@ func (c *Consumer) Close() error {
 	return nil
 }
 
-// ConsumeMessages consumes from all configured topics until ctx is cancelled
+// ConsumeMessages consumes from all configured topics and subscriptions until ctx is cancelled
 // (clean shutdown, returns nil) or a non-recoverable error occurs. The handler
 // may be invoked concurrently for different topics, but serially within one.
 func (c *Consumer) ConsumeMessages(ctx context.Context, handler func(*Message) error) error {
@@ -155,8 +271,8 @@ func (c *Consumer) ConsumeMessages(ctx context.Context, handler func(*Message) e
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	for _, topic := range c.config.Topics {
-		cons, err := c.ensureConsumer(runCtx, topic)
+	for _, sub := range c.subs {
+		cons, err := c.ensureConsumer(runCtx, sub)
 		if err != nil {
 			cancel()
 			wg.Wait()
@@ -174,7 +290,7 @@ func (c *Consumer) ConsumeMessages(ctx context.Context, handler func(*Message) e
 				mu.Unlock()
 				cancel() // one topic failing hard stops the whole consumer
 			}
-		}(topic, cons)
+		}(sub.topic, cons)
 	}
 
 	wg.Wait()
@@ -184,24 +300,21 @@ func (c *Consumer) ConsumeMessages(ctx context.Context, handler func(*Message) e
 	return firstErr
 }
 
-// ensureConsumer makes sure the stream exists and returns the group's durable
-// consumer on it, creating the consumer on first use.
-func (c *Consumer) ensureConsumer(ctx context.Context, topic string) (jetstream.Consumer, error) {
-	if err := ensureStream(ctx, c.js, topic, c.config.Stream); err != nil {
+// ensureConsumer makes sure the stream exists and returns the durable
+// consumer for sub, creating it on first use.
+func (c *Consumer) ensureConsumer(ctx context.Context, sub subscription) (jetstream.Consumer, error) {
+	if err := ensureStream(ctx, c.js, sub.topic, c.config.Stream, sub.scoped); err != nil {
 		return nil, err
 	}
 
-	streamName := sanitizeName(topic)
-	durable := sanitizeName(c.config.GroupID)
-
 	// Reuse the existing durable if present — avoids update conflicts on
 	// immutable fields like DeliverPolicy.
-	cons, err := c.js.Consumer(ctx, streamName, durable)
+	cons, err := c.js.Consumer(ctx, sub.stream, sub.durable)
 	if err == nil {
 		return cons, nil
 	}
 	if !errors.Is(err, jetstream.ErrConsumerNotFound) {
-		return nil, fmt.Errorf("failed to look up consumer %q on stream %q: %w", durable, streamName, err)
+		return nil, fmt.Errorf("failed to look up consumer %q on stream %q: %w", sub.durable, sub.stream, err)
 	}
 
 	deliverPolicy := jetstream.DeliverAllPolicy
@@ -209,9 +322,9 @@ func (c *Consumer) ensureConsumer(ctx context.Context, topic string) (jetstream.
 		deliverPolicy = jetstream.DeliverNewPolicy
 	}
 
-	cons, err = c.js.CreateConsumer(ctx, streamName, jetstream.ConsumerConfig{
-		Durable:           durable,
-		FilterSubject:     topic,
+	cons, err = c.js.CreateConsumer(ctx, sub.stream, jetstream.ConsumerConfig{
+		Durable:           sub.durable,
+		FilterSubject:     sub.filter,
 		DeliverPolicy:     deliverPolicy,
 		AckPolicy:         jetstream.AckExplicitPolicy,
 		AckWait:           c.config.AckWait,
@@ -219,7 +332,7 @@ func (c *Consumer) ensureConsumer(ctx context.Context, topic string) (jetstream.
 		InactiveThreshold: c.config.InactiveThreshold,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create consumer %q on stream %q: %w", durable, streamName, err)
+		return nil, fmt.Errorf("failed to create consumer %q on stream %q: %w", sub.durable, sub.stream, err)
 	}
 	return cons, nil
 }
@@ -258,12 +371,15 @@ func (c *Consumer) consumeTopic(ctx context.Context, topic string, cons jetstrea
 	}
 }
 
-// toMessage converts a JetStream message into the shared Message type.
+// toMessage converts a JetStream message into the shared Message type. topic
+// is the base topic; the concrete subject and its app scope are carried too.
 func toMessage(topic string, msg jetstream.Msg) *Message {
 	m := &Message{
-		Topic: topic,
-		Key:   []byte(msg.Headers().Get(KeyHeader)),
-		Value: msg.Data(),
+		Topic:   topic,
+		Key:     []byte(msg.Headers().Get(KeyHeader)),
+		Value:   msg.Data(),
+		Subject: msg.Subject(),
+		AppID:   AppIDFromSubject(topic, msg.Subject()),
 	}
 	if meta, err := msg.Metadata(); err == nil {
 		m.Offset = int64(meta.Sequence.Stream)

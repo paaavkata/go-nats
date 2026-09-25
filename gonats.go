@@ -5,14 +5,16 @@
 //
 // Concept mapping from Kafka:
 //
-//	topic            -> JetStream stream (name == topic) with a single subject (== topic)
+//	topic            -> JetStream stream (name == topic) with subject topic
+//	                    (plus "<topic>.*" for app-scoped topics, see subject.go)
 //	message key      -> "Nats-Msg-Key" header (no partitioning; streams are totally ordered)
 //	consumer group   -> durable pull consumer named after the group ID
 //	auto offset reset-> DeliverPolicy (earliest = all, latest = new)
 //
 // Streams are created idempotently by both producers and consumers, so service
 // startup order does not matter. If a stream already exists its configuration
-// is left untouched (infra/gitops may own it).
+// is left untouched (infra/gitops may own it), except that missing app-scoped
+// subjects are added (see ensureStream).
 package gonats
 
 import (
@@ -41,12 +43,24 @@ const (
 	// larger than the remaining reservation fails server-side with err 10047
 	// ("insufficient storage resources") even when the stream already exists.
 	DefaultStreamMaxBytes = 1 << 27
+	// DefaultStreamReplicas is the fallback when neither NATS_STREAM_REPLICAS
+	// nor ENV=prod applies (see replicasFromEnv).
 	DefaultStreamReplicas = 1
+
+	// MsgIDHeader is JetStream's dedup header: a repeat publish with the same
+	// ID inside the stream's duplicate window (2m default) is acked but not
+	// stored again.
+	MsgIDHeader = "Nats-Msg-Id"
 )
 
 // Message represents a consumed event. Field names mirror go-kafka's Message
 // so downstream code keeps compiling; Partition is always 0 and Offset is the
 // JetStream stream sequence.
+//
+// Topic is always the BASE topic (== stream), also for app-scoped messages, so
+// (Topic, Offset) stays a unique, stable identity for dedupe keys. Subject is
+// the concrete subject the message was published on and AppID the scope token
+// parsed from it ("" for a legacy flat-subject message).
 type Message struct {
 	Topic     string
 	Partition int32
@@ -54,6 +68,8 @@ type Message struct {
 	Key       []byte
 	Value     []byte
 	Timestamp time.Time
+	Subject   string
+	AppID     string
 }
 
 // TLSConfig holds TLS configuration for NATS connections.
@@ -74,11 +90,14 @@ type AuthConfig struct {
 }
 
 // StreamConfig controls how streams are created when they do not exist yet.
-// Existing streams are never modified.
+// Existing streams keep their configuration (only missing app-scoped subjects
+// are added; see ensureStream).
 type StreamConfig struct {
 	MaxAge   time.Duration // retention window (Kafka retention.ms equivalent)
 	MaxBytes int64         // size cap per stream
-	Replicas int           // JetStream replicas (1 in dev, 3 in prod)
+	// Replicas for newly created streams. Zero resolves from the environment:
+	// NATS_STREAM_REPLICAS if set, else 3 when ENV=="prod", else 1.
+	Replicas int
 }
 
 func applyStreamDefaults(c *StreamConfig) {
@@ -89,7 +108,7 @@ func applyStreamDefaults(c *StreamConfig) {
 		c.MaxBytes = DefaultStreamMaxBytes
 	}
 	if c.Replicas == 0 {
-		c.Replicas = DefaultStreamReplicas
+		c.Replicas = replicasFromEnv()
 	}
 }
 

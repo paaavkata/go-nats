@@ -6,6 +6,8 @@ import (
 )
 
 func TestApplyProducerDefaults(t *testing.T) {
+	t.Setenv(EnvStreamReplicas, "")
+	t.Setenv(EnvEnvironment, "")
 	cfg := &ProducerConfig{Topic: "test-topic"}
 	applyProducerDefaults(cfg)
 
