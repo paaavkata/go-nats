@@ -31,6 +31,30 @@ after `RetryBackoff`, up to `MaxDeliver` attempts, then the server stops
 redelivering. Messages within one topic are processed serially (preserves
 order); different topics are consumed concurrently.
 
+## Resilience (v0.5.0)
+
+- **Dead-letter**: a message whose handler fails on its last delivery
+  (`NumDelivered >= MaxDeliver`) is copied to stream `dead-letter`, subject
+  `dlq.<original subject>`, with the original headers plus `Dlq-Reason`,
+  `Dlq-Stream`, `Dlq-Consumer`, `Dlq-Original-Subject`, `Dlq-Original-Sequence`,
+  then terminated on the source consumer. The stream is created on first
+  consumer start (`EnsureDeadLetterStream`): Limits retention, 14d / 256 MiB,
+  replicas by the same `ENV` / `NATS_STREAM_REPLICAS` rule as business
+  streams. `MaxDeliver <= 0` (unlimited) never dead-letters. Replay a message
+  with `nats stream get dead-letter <seq>` and republish to the original subject.
+- **Panic isolation**: a handler panic is recovered, logged with its stack and
+  counted as a handler error (Nak, then dead-letter on the last attempt). The
+  consume loop keeps running.
+- **Loop health**: `Consumer.Healthy(ctx) error` returns the error that made
+  `ConsumeMessages` exit unexpectedly (iterator failure, consumer deleted
+  server-side), nil while running or after `Close`. Wire it into readiness:
+  `mgr.AddReadinessCheck("nats-consumer", consumer.Healthy)`.
+- **Metrics**: `Consumer.RegisterMetrics(prometheus.Registerer)` exposes
+  `gonats_dead_letter_total{topic}` and `gonats_handler_panics_total{topic}`.
+- Fixed in the same release: a dead iterator used to hang the topic goroutine
+  forever (the stop watcher waited for a ctx cancel that only happened after the
+  loop returned), so the pod stayed Ready with no consumer.
+
 ## Configuration (Viper keys)
 
 ### Connection (shared)

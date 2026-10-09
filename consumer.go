@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/viper"
 )
 
@@ -24,13 +26,23 @@ const (
 //
 // Delivery semantics: at-least-once. When the handler returns nil the message
 // is acked; on error it is redelivered after RetryBackoff, up to MaxDeliver
-// attempts. Messages within a topic are processed serially, preserving stream
-// order (stronger than Kafka's per-partition ordering).
+// attempts. On the last failed attempt the message is copied to the
+// dead-letter stream (see deadletter.go) and terminated, so nothing is dropped
+// silently. A handler panic is recovered and treated as a handler error.
+// Messages within a topic are processed serially, preserving stream order
+// (stronger than Kafka's per-partition ordering).
 type Consumer struct {
 	nc     *nats.Conn
 	js     jetstream.JetStream
 	config *ConsumerConfig
 	subs   []subscription
+
+	mu      sync.Mutex
+	loopErr error // last unexpected exit of ConsumeMessages
+	closed  bool
+
+	deadLetters  *prometheus.CounterVec
+	handlerPanic *prometheus.CounterVec
 }
 
 // TopicSubscription selects which subjects of one base topic a consumer reads.
@@ -252,10 +264,71 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 // Close closes the underlying connection. Pending unacked messages are
 // redelivered to the group after AckWait.
 func (c *Consumer) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
 	if c.nc != nil && !c.nc.IsClosed() {
 		c.nc.Close()
 	}
 	return nil
+}
+
+// Healthy reports whether the consume loop is alive. It returns the error that
+// made ConsumeMessages exit unexpectedly (iterator failure, consumer deleted
+// server-side, ...), nil while the loop runs or after a clean Close. Wire it
+// into readiness: mgr.AddReadinessCheck("nats-consumer", consumer.Healthy).
+func (c *Consumer) Healthy(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	return c.loopErr
+}
+
+func (c *Consumer) setLoopErr(err error) {
+	c.mu.Lock()
+	c.loopErr = err
+	c.mu.Unlock()
+}
+
+// RegisterMetrics registers the consumer's counters on reg:
+//
+//	gonats_dead_letter_total{topic}     messages moved to the dead-letter stream
+//	gonats_handler_panics_total{topic}  handler panics recovered
+//
+// Call once per process (a second registration on the same registry errors).
+func (c *Consumer) RegisterMetrics(reg prometheus.Registerer) error {
+	dl := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gonats_dead_letter_total",
+		Help: "Messages copied to the dead-letter stream after exhausting MaxDeliver.",
+	}, []string{"topic"})
+	hp := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "gonats_handler_panics_total",
+		Help: "Handler panics recovered by the consumer loop.",
+	}, []string{"topic"})
+	if err := reg.Register(dl); err != nil {
+		return err
+	}
+	if err := reg.Register(hp); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.deadLetters, c.handlerPanic = dl, hp
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Consumer) countDeadLetter(topic string) {
+	if c.deadLetters != nil {
+		c.deadLetters.WithLabelValues(topic).Inc()
+	}
+}
+
+func (c *Consumer) countPanic(topic string) {
+	if c.handlerPanic != nil {
+		c.handlerPanic.WithLabelValues(topic).Inc()
+	}
 }
 
 // ConsumeMessages consumes from all configured topics and subscriptions until ctx is cancelled
@@ -270,19 +343,27 @@ func (c *Consumer) ConsumeMessages(ctx context.Context, handler func(*Message) e
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	c.setLoopErr(nil)
+
+	// Best effort: a missing dead-letter stream must not stop consumption;
+	// deadLetter() logs the publish failure per message instead.
+	if err := EnsureDeadLetterStream(runCtx, c.js, c.config.Stream); err != nil {
+		logPrintf("dead-letter stream unavailable: %v", err)
+	}
 
 	for _, sub := range c.subs {
 		cons, err := c.ensureConsumer(runCtx, sub)
 		if err != nil {
 			cancel()
 			wg.Wait()
+			c.setLoopErr(err)
 			return err
 		}
 
 		wg.Add(1)
-		go func(topic string, cons jetstream.Consumer) {
+		go func(sub subscription, cons jetstream.Consumer) {
 			defer wg.Done()
-			if err := c.consumeTopic(runCtx, topic, cons, handler); err != nil {
+			if err := c.consumeTopic(runCtx, sub, cons, handler); err != nil {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -290,12 +371,15 @@ func (c *Consumer) ConsumeMessages(ctx context.Context, handler func(*Message) e
 				mu.Unlock()
 				cancel() // one topic failing hard stops the whole consumer
 			}
-		}(sub.topic, cons)
+		}(sub, cons)
 	}
 
 	wg.Wait()
 	if ctx.Err() != nil {
 		return nil // context cancellation is a clean shutdown, not an error
+	}
+	if firstErr != nil {
+		c.setLoopErr(firstErr)
 	}
 	return firstErr
 }
@@ -338,20 +422,31 @@ func (c *Consumer) ensureConsumer(ctx context.Context, sub subscription) (jetstr
 }
 
 // consumeTopic runs the serial fetch/handle/ack loop for one topic.
-func (c *Consumer) consumeTopic(ctx context.Context, topic string, cons jetstream.Consumer, handler func(*Message) error) error {
+func (c *Consumer) consumeTopic(ctx context.Context, sub subscription, cons jetstream.Consumer, handler func(*Message) error) error {
+	topic := sub.topic
 	it, err := cons.Messages()
 	if err != nil {
 		return fmt.Errorf("failed to start message iterator for topic %q: %w", topic, err)
 	}
 
-	// Unblock it.Next() when the context is cancelled.
+	// Unblock it.Next() when the context is cancelled. `done` lets the watcher
+	// exit when the loop returns on its own (iterator error): before this, the
+	// deferred <-stopped waited for a ctx cancel that ConsumeMessages only
+	// issues after consumeTopic returns, so a dead iterator hung the topic
+	// goroutine forever and the pod stayed Ready with no consumer.
 	stopped := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
 		it.Stop()
 	}()
+	// Deferred LIFO: close(done) runs first, then wait for the watcher.
 	defer func() { <-stopped }()
+	defer close(done)
 
 	for {
 		msg, err := it.Next()
@@ -362,13 +457,55 @@ func (c *Consumer) consumeTopic(ctx context.Context, topic string, cons jetstrea
 			return fmt.Errorf("failed to fetch message from topic %q: %w", topic, err)
 		}
 
-		if err := handler(toMessage(topic, msg)); err != nil {
-			// Redeliver after backoff; the server gives up after MaxDeliver.
+		if err := c.safeHandle(topic, handler, toMessage(topic, msg)); err != nil {
+			if c.lastDelivery(msg) {
+				// Last attempt: park a copy on the dead-letter stream, then
+				// terminate so the server stops redelivering. If the DLQ
+				// publish fails, leave the message to the server (it is
+				// dropped after MaxDeliver either way) and log loudly.
+				if dlqErr := c.deadLetter(ctx, sub, msg, err); dlqErr != nil {
+					logPrintf("dead-letter publish failed topic=%q subject=%q msg_id=%q: %v (handler error: %v)",
+						topic, msg.Subject(), msg.Headers().Get(MsgIDHeader), dlqErr, err)
+					_ = msg.NakWithDelay(c.config.RetryBackoff)
+					continue
+				}
+				c.countDeadLetter(topic)
+				logPrintf("dead-lettered topic=%q subject=%q after %d deliveries: %v", topic, msg.Subject(), c.config.MaxDeliver, err)
+				_ = msg.Term()
+				continue
+			}
+			// Redeliver after backoff.
 			_ = msg.NakWithDelay(c.config.RetryBackoff)
 			continue
 		}
 		_ = msg.Ack()
 	}
+}
+
+// safeHandle invokes handler, converting a panic into an error so one poison
+// message cannot crash the process.
+func (c *Consumer) safeHandle(topic string, handler func(*Message) error, m *Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.countPanic(topic)
+			logPrintf("handler panic topic=%q subject=%q: %v\n%s", topic, m.Subject, r, debug.Stack())
+			err = fmt.Errorf("handler panic: %v", r)
+		}
+	}()
+	return handler(m)
+}
+
+// lastDelivery reports whether msg is on its final delivery attempt.
+// MaxDeliver <= 0 means unlimited redelivery, so never true.
+func (c *Consumer) lastDelivery(msg jetstream.Msg) bool {
+	if c.config.MaxDeliver <= 0 {
+		return false
+	}
+	meta, err := msg.Metadata()
+	if err != nil {
+		return false
+	}
+	return meta.NumDelivered >= uint64(c.config.MaxDeliver)
 }
 
 // toMessage converts a JetStream message into the shared Message type. topic
