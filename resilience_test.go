@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -17,11 +18,28 @@ import (
 
 // fakeIterator returns one error from Next, simulating a consumer deleted
 // server-side or any iterator failure.
-type fakeIterator struct{ err error }
+type fakeIterator struct {
+	err  error
+	next func() (jetstream.Msg, error) // optional; overrides err
+}
 
-func (f *fakeIterator) Next() (jetstream.Msg, error) { return nil, f.err }
-func (f *fakeIterator) Stop()                        {}
-func (f *fakeIterator) Drain()                       {}
+func (f *fakeIterator) Next() (jetstream.Msg, error) {
+	if f.next != nil {
+		return f.next()
+	}
+	return nil, f.err
+}
+
+// fakeMsg implements just what consumeIterator touches on a delivered message.
+type fakeMsg struct{ jetstream.Msg }
+
+func (fakeMsg) Headers() nats.Header                      { return nats.Header{} }
+func (fakeMsg) Data() []byte                              { return []byte("{}") }
+func (fakeMsg) Subject() string                           { return "t" }
+func (fakeMsg) Metadata() (*jetstream.MsgMetadata, error) { return nil, errors.New("fake") }
+func (fakeMsg) Ack() error                                { return nil }
+func (f *fakeIterator) Stop()                             {}
+func (f *fakeIterator) Drain()                            {}
 
 type fakeConsumer struct {
 	jetstream.Consumer // nil: any other method panics, which a test would surface
@@ -32,23 +50,53 @@ func (f *fakeConsumer) Messages(...jetstream.PullMessagesOpt) (jetstream.Message
 	return f.it, nil
 }
 
-func TestHealthyReflectsLoopExit(t *testing.T) {
+// A failing iterator must not end the consumer (2026-10-18: JetStream quorum
+// loss left every pod unready until a manual restart). consumeTopic retries,
+// Healthy reports the error meanwhile and clears once a message arrives.
+func TestHealthyReflectsIteratorRecovery(t *testing.T) {
 	c := &Consumer{config: &ConsumerConfig{}}
 	applyConsumerDefaults(c.config)
+	c.config.RetryBackoff = time.Millisecond
 	if err := c.Healthy(context.Background()); err != nil {
 		t.Fatalf("fresh consumer must be healthy, got %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	sub := subscription{topic: "t", stream: "t", durable: "g"}
-	boom := errors.New("consumer deleted")
-	err := c.consumeTopic(context.Background(), sub, &fakeConsumer{it: &fakeIterator{err: boom}}, func(*Message) error { return nil })
-	if err == nil || !errors.Is(err, boom) {
-		t.Fatalf("consumeTopic must surface the iterator error, got %v", err)
+	boom := errors.New("nats: no heartbeat received")
+	var calls int
+	var unhealthyWhileRetrying bool
+	it := &fakeIterator{next: func() (jetstream.Msg, error) {
+		if ctx.Err() != nil {
+			return nil, jetstream.ErrMsgIteratorClosed
+		}
+		calls++
+		if calls <= 2 {
+			return nil, boom
+		}
+		if got := c.Healthy(ctx); got != nil && strings.Contains(got.Error(), "no heartbeat") {
+			unhealthyWhileRetrying = true
+		}
+		return fakeMsg{}, nil
+	}}
+	var handled int
+	err := c.consumeTopic(ctx, sub, &fakeConsumer{it: it}, func(*Message) error {
+		handled++
+		cancel()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("consumeTopic after ctx cancel = %v, want nil", err)
 	}
-	// ConsumeMessages records the exit; emulate that step.
-	c.setLoopErr(err)
-	if got := c.Healthy(context.Background()); got == nil || !strings.Contains(got.Error(), "consumer deleted") {
-		t.Fatalf("Healthy after loop death = %v", got)
+	if calls != 3 || handled != 1 {
+		t.Fatalf("Next calls = %d, handled = %d; want 3 and 1", calls, handled)
+	}
+	if !unhealthyWhileRetrying {
+		t.Fatal("Healthy must report the iterator error while retrying")
+	}
+	if got := c.Healthy(context.Background()); got != nil {
+		t.Fatalf("Healthy after recovery = %v, want nil", got)
 	}
 
 	if err := c.Close(); err != nil {

@@ -19,6 +19,9 @@ const (
 	DefaultConsumerAckWait      = 30 * time.Second
 	DefaultConsumerMaxDeliver   = 5
 	DefaultConsumerRetryBackoff = 2 * time.Second
+	// maxIteratorBackoff caps the wait between attempts to rebuild a failed
+	// message iterator (see consumeTopic).
+	maxIteratorBackoff = 30 * time.Second
 )
 
 // Consumer consumes messages from one or more topics as part of a "group"
@@ -421,12 +424,56 @@ func (c *Consumer) ensureConsumer(ctx context.Context, sub subscription) (jetstr
 	return cons, nil
 }
 
-// consumeTopic runs the serial fetch/handle/ack loop for one topic.
+// consumeTopic keeps one topic consuming until ctx is cancelled. A failed
+// iterator (JetStream quorum loss, "no heartbeat received", consumer deleted
+// server-side, reconnect) is rebuilt after a capped exponential backoff
+// instead of ending the consumer for the life of the pod. Healthy reports the
+// fetch error while recovery is in progress and clears once messages flow.
 func (c *Consumer) consumeTopic(ctx context.Context, sub subscription, cons jetstream.Consumer, handler func(*Message) error) error {
+	backoff := c.config.RetryBackoff
+	for {
+		progressed, err := c.consumeIterator(ctx, sub, cons, handler)
+		if err == nil || ctx.Err() != nil {
+			return nil
+		}
+		if progressed {
+			backoff = c.config.RetryBackoff
+		}
+		c.setLoopErr(err)
+		logPrintf("consumer topic=%q fetch failed, retrying in %v: %v", sub.topic, backoff, err)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+		if backoff < maxIteratorBackoff {
+			backoff *= 2
+		}
+		// A deleted or missing durable has to be recreated; other errors reuse
+		// the handle (Messages() opens a fresh pull subscription each time).
+		if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) {
+			if cons, err = c.ensureConsumer(ctx, sub); err != nil {
+				logPrintf("consumer topic=%q recreate failed: %v", sub.topic, err)
+				cons = nil
+			}
+		}
+		if cons == nil {
+			if cons, err = c.ensureConsumer(ctx, sub); err != nil {
+				cons = nil
+				continue
+			}
+		}
+	}
+}
+
+// consumeIterator runs the serial fetch/handle/ack loop for one topic over a
+// single message iterator. progressed reports whether at least one message
+// was fetched before the iterator failed.
+func (c *Consumer) consumeIterator(ctx context.Context, sub subscription, cons jetstream.Consumer, handler func(*Message) error) (progressed bool, retErr error) {
 	topic := sub.topic
 	it, err := cons.Messages()
 	if err != nil {
-		return fmt.Errorf("failed to start message iterator for topic %q: %w", topic, err)
+		return false, fmt.Errorf("failed to start message iterator for topic %q: %w", topic, err)
 	}
 
 	// Unblock it.Next() when the context is cancelled. `done` lets the watcher
@@ -452,9 +499,13 @@ func (c *Consumer) consumeTopic(ctx context.Context, sub subscription, cons jets
 		msg, err := it.Next()
 		if err != nil {
 			if errors.Is(err, jetstream.ErrMsgIteratorClosed) || ctx.Err() != nil {
-				return nil
+				return progressed, nil
 			}
-			return fmt.Errorf("failed to fetch message from topic %q: %w", topic, err)
+			return progressed, fmt.Errorf("failed to fetch message from topic %q: %w", topic, err)
+		}
+		progressed = true
+		if c.Healthy(ctx) != nil {
+			c.setLoopErr(nil) // recovered
 		}
 
 		if err := c.safeHandle(topic, handler, toMessage(topic, msg)); err != nil {
