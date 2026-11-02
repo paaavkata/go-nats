@@ -44,10 +44,65 @@ func (f *fakeIterator) Drain()                            {}
 type fakeConsumer struct {
 	jetstream.Consumer // nil: any other method panics, which a test would surface
 	it                 *fakeIterator
+	infoErr            error // Info result; nil = reachable
 }
 
 func (f *fakeConsumer) Messages(...jetstream.PullMessagesOpt) (jetstream.MessagesContext, error) {
 	return f.it, nil
+}
+
+func (f *fakeConsumer) Info(context.Context) (*jetstream.ConsumerInfo, error) {
+	if f.infoErr != nil {
+		return nil, f.infoErr
+	}
+	return &jetstream.ConsumerInfo{}, nil
+}
+
+// One missed heartbeat on an idle topic (2026-11-02: agent-service and
+// finding-service unready for hours in prod). The rebuilt iterator proves the
+// server reachable via Info and Healthy clears without any message flowing;
+// while Info fails the error stays reported.
+func TestHealthyClearsOnRebuiltIdleIterator(t *testing.T) {
+	c := &Consumer{config: &ConsumerConfig{}}
+	applyConsumerDefaults(c.config)
+	c.config.RetryBackoff = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sub := subscription{topic: "t", stream: "t", durable: "g"}
+	fc := &fakeConsumer{infoErr: errors.New("nats: no servers available")}
+	healthyAfterRebuild := make(chan error, 1)
+	var calls int
+	fc.it = &fakeIterator{next: func() (jetstream.Msg, error) {
+		calls++
+		switch calls {
+		case 1:
+			return nil, errors.New("nats: no heartbeat received")
+		case 2: // rebuilt while server still unreachable: must stay unhealthy
+			if c.Healthy(ctx) == nil {
+				t.Error("Healthy cleared while Info still fails")
+			}
+			fc.infoErr = nil
+			return nil, errors.New("nats: no heartbeat received")
+		default: // rebuilt with server back, topic idle: block like a real Next
+			healthyAfterRebuild <- c.Healthy(ctx)
+			<-ctx.Done()
+			return nil, jetstream.ErrMsgIteratorClosed
+		}
+	}}
+	done := make(chan error, 1)
+	go func() { done <- c.consumeTopic(ctx, sub, fc, func(*Message) error { return nil }) }()
+	select {
+	case got := <-healthyAfterRebuild:
+		if got != nil {
+			t.Fatalf("Healthy after idle rebuild = %v, want nil", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("iterator never rebuilt")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("consumeTopic after ctx cancel = %v, want nil", err)
+	}
 }
 
 // A failing iterator must not end the consumer (2026-10-18: JetStream quorum
@@ -81,7 +136,7 @@ func TestHealthyReflectsIteratorRecovery(t *testing.T) {
 		return fakeMsg{}, nil
 	}}
 	var handled int
-	err := c.consumeTopic(ctx, sub, &fakeConsumer{it: it}, func(*Message) error {
+	err := c.consumeTopic(ctx, sub, &fakeConsumer{it: it, infoErr: boom}, func(*Message) error {
 		handled++
 		cancel()
 		return nil

@@ -475,6 +475,19 @@ func (c *Consumer) consumeIterator(ctx context.Context, sub subscription, cons j
 	if err != nil {
 		return false, fmt.Errorf("failed to start message iterator for topic %q: %w", topic, err)
 	}
+	// A rebuilt iterator on an idle topic never fetches a message, so clearing
+	// loopErr only on progress left pods unready for hours after one missed
+	// heartbeat (2026-11-02). Messages() succeeds even while disconnected
+	// (nats.go buffers the subscribe), so prove the server is reachable and
+	// the durable exists with an Info round-trip before reporting healthy.
+	if c.Healthy(ctx) != nil {
+		infoCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, infoErr := cons.Info(infoCtx)
+		cancel()
+		if infoErr == nil {
+			c.setLoopErr(nil) // recovered
+		}
+	}
 
 	// Unblock it.Next() when the context is cancelled. `done` lets the watcher
 	// exit when the loop returns on its own (iterator error): before this, the
