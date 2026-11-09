@@ -87,6 +87,12 @@ serially (preserves order); different topics are consumed concurrently.
   `ConsumeMessages` exit unexpectedly (iterator failure, consumer deleted
   server-side), nil while running or after `Close`. Wire it into readiness:
   `mgr.AddReadinessCheck("nats-consumer", consumer.Healthy)`.
+- **Readiness retry** (v0.5.2, v0.7.1): a failed iterator is rebuilt after a
+  capped exponential backoff instead of ending the consumer; `Healthy` reports
+  the fetch error while recovery runs. A rebuilt iterator on an idle topic
+  proves the server reachable with a consumer `Info` round-trip, retried every
+  `RetryBackoff` until it answers, so idle pods no longer stay unready after a
+  missed heartbeat or a JetStream quorum loss. Use v0.7.1 or later.
 - **Metrics**: `Consumer.RegisterMetrics(prometheus.Registerer)` exposes
   `gonats_dead_letter_total{topic}` and `gonats_handler_panics_total{topic}`.
 - Fixed in the same release: a dead iterator used to hang the topic goroutine
@@ -103,9 +109,17 @@ serially (preserves order); different topics are consumed concurrently.
 - Environment fallback (since v0.7.0): when the caller passes no `Auth` (or an
   empty one), `connect` reads `NATS_CREDS_FILE`, then `NATS_TOKEN`, then
   `NATS_USER`/`NATS_PASSWORD`. Platform services set `NATS_USER=<service>` in
-  `envVars` and `NATS_PASSWORD` in `secretEnvVars` from the namespace's
-  `nats-credentials` SealedSecret; no code change is needed. `AuthConfigFromEnv()`
-  exposes the same lookup.
+  the chart `parent.env` map and `NATS_PASSWORD` in `parent.secretEnv` from the
+  namespace's `nats-credentials` SealedSecret (key = service name); no code
+  change is needed. `AuthConfigFromEnv()` exposes the same lookup.
+
+  ```yaml
+  parent:
+    env:
+      NATS_USER: "cms-service"
+    secretEnv:
+      NATS_PASSWORD: {secretName: nats-credentials, secretKey: cms-service, optional: true}
+  ```
 
 ### Stream creation (used only when a stream doesn't exist yet)
 - `nats.stream.max_age`: retention window (default: `168h`)
