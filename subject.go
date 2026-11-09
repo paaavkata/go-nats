@@ -2,6 +2,7 @@ package gonats
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -36,6 +37,16 @@ var AppScopedTopics = []string{
 	"job-status-changed",
 	"audit-events",
 	"send-email",
+}
+
+// RequestTopics lists base topics that carry work requests. Their streams use
+// DiscardNew: when the stream is full a publish fails instead of the server
+// silently evicting the oldest unprocessed request (see ensureStream).
+var RequestTopics = []string{"job"}
+
+// IsRequestTopic reports whether base is one of RequestTopics.
+func IsRequestTopic(base string) bool {
+	return slices.Contains(RequestTopics, base)
 }
 
 // IsAppScopedTopic reports whether base is one of AppScopedTopics.

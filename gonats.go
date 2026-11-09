@@ -14,10 +14,12 @@
 // Streams are created idempotently by both producers and consumers, so service
 // startup order does not matter. If a stream already exists its configuration
 // is left untouched (infra/gitops may own it), except that missing app-scoped
-// subjects are added (see ensureStream).
+// subjects are added and request streams are switched to DiscardNew (see
+// ensureStream).
 package gonats
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -51,6 +53,14 @@ const (
 	// ID inside the stream's duplicate window (2m default) is acked but not
 	// stored again.
 	MsgIDHeader = "Nats-Msg-Id"
+
+	// TraceIDHeader carries the originating request id across the bus. The
+	// producer fills it from ctx.Value(TraceIDContextKey); consumers read it
+	// as Message.TraceID.
+	TraceIDHeader = "Trace-Id"
+	// TraceIDContextKey is the untyped context key go-server stores the
+	// request id under and go-logger reads ("trace_id").
+	TraceIDContextKey = "trace_id"
 )
 
 // Message represents a consumed event. Field names mirror go-kafka's Message
@@ -60,7 +70,8 @@ const (
 // Topic is always the BASE topic (== stream), also for app-scoped messages, so
 // (Topic, Offset) stays a unique, stable identity for dedupe keys. Subject is
 // the concrete subject the message was published on and AppID the scope token
-// parsed from it ("" for a legacy flat-subject message).
+// parsed from it ("" for a legacy flat-subject message). TraceID is the
+// Trace-Id header ("" when the publisher had no trace id).
 type Message struct {
 	Topic     string
 	Partition int32
@@ -70,6 +81,20 @@ type Message struct {
 	Timestamp time.Time
 	Subject   string
 	AppID     string
+	TraceID   string
+}
+
+// Context returns parent carrying the message's trace id under the
+// "trace_id" key, so go-logger *Ctx calls and go-server clients pick it up.
+// parent is returned unchanged when the message has no trace id.
+func (m *Message) Context(parent context.Context) context.Context {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if m.TraceID == "" {
+		return parent
+	}
+	return context.WithValue(parent, TraceIDContextKey, m.TraceID) //nolint:staticcheck // untyped key shared with go-server and go-logger
 }
 
 // TLSConfig holds TLS configuration for NATS connections.

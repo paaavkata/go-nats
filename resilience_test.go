@@ -3,7 +3,9 @@ package gonats
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -356,4 +358,246 @@ func streamInfoByName(t *testing.T, js jetstream.JetStream, name string) *jetstr
 		t.Fatal(err)
 	}
 	return s.CachedInfo()
+}
+
+// --- concurrency, reconciliation, request streams, trace id ---
+
+// seqMsg is a fakeMsg carrying its sequence number as the payload.
+type seqMsg struct {
+	fakeMsg
+	n int
+}
+
+func (m seqMsg) Data() []byte { return []byte(strconv.Itoa(m.n)) }
+
+// runIterator feeds total seqMsgs through consumeIterator with the given
+// concurrency and returns the peak number of handlers running at once and the
+// order in which handlers started.
+func runIterator(t *testing.T, concurrency, total int) (peak int32, order []int) {
+	t.Helper()
+	sent := 0
+	it := &fakeIterator{next: func() (jetstream.Msg, error) {
+		if sent == total {
+			return nil, jetstream.ErrMsgIteratorClosed
+		}
+		sent++
+		return seqMsg{n: sent - 1}, nil
+	}}
+	cfg := &ConsumerConfig{Concurrency: concurrency}
+	applyConsumerDefaults(cfg)
+	c := &Consumer{config: cfg}
+
+	var (
+		active atomic.Int32
+		mu     sync.Mutex
+	)
+	_, err := c.consumeIterator(context.Background(), subscription{topic: "t"}, &fakeConsumer{it: it}, func(m *Message) error {
+		n, _ := strconv.Atoi(string(m.Value))
+		mu.Lock()
+		order = append(order, n)
+		mu.Unlock()
+		cur := active.Add(1)
+		for {
+			p := atomic.LoadInt32(&peak)
+			if cur <= p || atomic.CompareAndSwapInt32(&peak, p, cur) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		active.Add(-1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("consumeIterator: %v", err)
+	}
+	if len(order) != total {
+		t.Fatalf("handled %d messages, want %d (workers must finish before return)", len(order), total)
+	}
+	return peak, order
+}
+
+func TestConcurrencyBoundsParallelHandlers(t *testing.T) {
+	peak, _ := runIterator(t, 4, 40)
+	if peak != 4 {
+		t.Fatalf("peak concurrent handlers = %d, want 4", peak)
+	}
+}
+
+func TestConcurrencyOneIsSerialInOrder(t *testing.T) {
+	peak, order := runIterator(t, 1, 20)
+	if peak != 1 {
+		t.Fatalf("peak concurrent handlers = %d, want 1", peak)
+	}
+	for i, n := range order {
+		if n != i {
+			t.Fatalf("order = %v, want 0..19 in sequence", order)
+		}
+	}
+}
+
+func TestIntegrationReconcileExistingDurable(t *testing.T) {
+	url, js := testServer(t)
+	t.Setenv(EnvStreamReplicas, "")
+	t.Setenv(EnvEnvironment, "")
+	topic := uniqueTopic(t, js)
+	ctx := context.Background()
+
+	ensure := func(cfg *ConsumerConfig) *jetstream.ConsumerConfig {
+		t.Helper()
+		cfg.URLs, cfg.GroupID, cfg.Topics = []string{url}, "reconcile-grp", []string{topic}
+		c, err := NewConsumer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if _, err := c.ensureConsumer(ctx, c.subs[0]); err != nil {
+			t.Fatal(err)
+		}
+		cons, err := js.Consumer(ctx, StreamName(topic), DurableName("reconcile-grp", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := cons.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &info.Config
+	}
+
+	if got := ensure(&ConsumerConfig{AckWait: 30 * time.Second}); got.AckWait != 30*time.Second {
+		t.Fatalf("created AckWait = %v, want 30s", got.AckWait)
+	}
+	got := ensure(&ConsumerConfig{AckWait: 120 * time.Second, MaxDeliver: 7, Concurrency: 4, InactiveThreshold: time.Hour})
+	if got.AckWait != 120*time.Second || got.MaxDeliver != 7 || got.MaxAckPending != 4 || got.InactiveThreshold != time.Hour {
+		t.Fatalf("reconciled config ack_wait=%v max_deliver=%d max_ack_pending=%d inactive=%v, want 120s/7/4/1h",
+			got.AckWait, got.MaxDeliver, got.MaxAckPending, got.InactiveThreshold)
+	}
+}
+
+func TestIntegrationRequestStreamDiscardNew(t *testing.T) {
+	url, js := testServer(t)
+	t.Setenv(EnvStreamReplicas, "")
+	t.Setenv(EnvEnvironment, "")
+	ctx := context.Background()
+	existingTopic, freshTopic := uniqueTopic(t, js), uniqueTopic(t, js)+"-fresh"
+	t.Cleanup(func() { _ = js.DeleteStream(ctx, StreamName(freshTopic)) })
+	saved := RequestTopics
+	RequestTopics = []string{existingTopic, freshTopic}
+	t.Cleanup(func() { RequestTopics = saved })
+
+	const maxBytes = 512
+	// An existing request stream with the old policy is switched to DiscardNew.
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: StreamName(existingTopic), Subjects: []string{existingTopic},
+		Discard: jetstream.DiscardOld, MaxBytes: maxBytes, Storage: jetstream.FileStorage,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prod, err := NewProducer(&ProducerConfig{URLs: []string{url}, Topic: existingTopic, Stream: StreamConfig{MaxBytes: maxBytes}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	if d := streamInfo(t, js, existingTopic).Config.Discard; d != jetstream.DiscardNew {
+		t.Fatalf("existing request stream discard = %v, want new", d)
+	}
+
+	// Fill it: a publish eventually fails and the first message stays stored.
+	var pubErr error
+	for i := 0; i < 50 && pubErr == nil; i++ {
+		pubErr = prod.SendMessage("", payload{i})
+	}
+	if pubErr == nil {
+		t.Fatal("publishing to a full DiscardNew stream never failed")
+	}
+	if st := streamInfo(t, js, existingTopic).State; st.FirstSeq != 1 || st.Msgs == 0 {
+		t.Fatalf("stream state first_seq=%d msgs=%d, want first message still stored", st.FirstSeq, st.Msgs)
+	}
+
+	// A new request stream is created with DiscardNew.
+	fresh, err := NewProducer(&ProducerConfig{URLs: []string{url}, Topic: freshTopic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if d := streamInfo(t, js, freshTopic).Config.Discard; d != jetstream.DiscardNew {
+		t.Fatalf("new request stream discard = %v, want new", d)
+	}
+}
+
+func TestIntegrationTraceIDRoundTripAndDLQ(t *testing.T) {
+	url, js := testServer(t)
+	t.Setenv(EnvStreamReplicas, "")
+	t.Setenv(EnvEnvironment, "")
+	topic := uniqueTopic(t, js)
+	ctx := context.Background()
+	t.Cleanup(func() { _ = js.DeleteStream(ctx, DeadLetterStream) })
+
+	prod, err := NewProducer(&ProducerConfig{URLs: []string{url}, Topic: topic, AppScoped: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	traced := context.WithValue(ctx, TraceIDContextKey, "trace-abc") //nolint:staticcheck // same untyped key as go-server
+	if err := prod.SendScopedWithMsgID(traced, "app1", "k", "mid-1", payload{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := prod.SendScoped(ctx, "app1", "k", payload{2}); err != nil {
+		t.Fatal(err)
+	}
+
+	cons, err := NewConsumer(&ConsumerConfig{
+		URLs: []string{url}, GroupID: "trace-grp", Subscriptions: []TopicSubscription{SubscribeApp(topic, "app1")},
+		MaxDeliver: 1, RetryBackoff: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cons.Close()
+
+	var (
+		mu     sync.Mutex
+		traces = map[string]any{}
+	)
+	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	go func() {
+		_ = cons.ConsumeMessages(runCtx, func(m *Message) error {
+			mu.Lock()
+			traces[string(m.Value)] = m.Context(ctx).Value("trace_id")
+			if m.TraceID != "" && m.TraceID != traces[string(m.Value)] {
+				traces[string(m.Value)] = "mismatch"
+			}
+			mu.Unlock()
+			if strings.Contains(string(m.Value), `"n":1`) {
+				return errors.New("fail traced message")
+			}
+			return nil
+		})
+	}()
+
+	dlq := waitForDLQ(t, js, 1)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(traces)
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := traces[`{"n":1}`]; got != "trace-abc" {
+		t.Fatalf("traced message context trace_id = %v, want trace-abc", got)
+	}
+	if got, ok := traces[`{"n":2}`]; !ok || got != nil {
+		t.Fatalf("untraced message context trace_id = %v (seen %v), want none", got, ok)
+	}
+	if h := dlq[0].Header; h.Get(TraceIDHeader) != "trace-abc" || h.Get(DlqMsgIDHeader) != "mid-1" {
+		t.Fatalf("dlq headers Trace-Id=%q Dlq-Original-Msg-Id=%q, want trace-abc/mid-1", h.Get(TraceIDHeader), h.Get(DlqMsgIDHeader))
+	}
 }

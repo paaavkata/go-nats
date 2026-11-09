@@ -191,6 +191,9 @@ func (p *Producer) publish(ctx context.Context, subject, key, msgID string, valu
 	if msgID != "" {
 		msg.Header.Set(MsgIDHeader, msgID)
 	}
+	if traceID, _ := ctx.Value(TraceIDContextKey).(string); traceID != "" {
+		msg.Header.Set(TraceIDHeader, traceID)
+	}
 
 	if _, err := p.js.PublishMsg(ctx, msg); err != nil {
 		return fmt.Errorf("failed to send message to %q: %w", subject, err)

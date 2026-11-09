@@ -24,6 +24,9 @@ const (
 	DlqConsumerHeader = "Dlq-Consumer"
 	DlqSubjectHeader  = "Dlq-Original-Subject"
 	DlqSequenceHeader = "Dlq-Original-Sequence"
+	// DlqMsgIDHeader keeps the original Nats-Msg-Id, which the copy replaces
+	// with its own dedup id.
+	DlqMsgIDHeader = "Dlq-Original-Msg-Id"
 )
 
 // DeadLetterSubject returns the dead-letter subject for an original subject.
@@ -60,7 +63,8 @@ func EnsureDeadLetterStream(ctx context.Context, js jetstream.JetStream, cfg Str
 }
 
 // deadLetter copies msg to the dead-letter stream. The copy keeps the original
-// headers and adds the Dlq-* headers. It does not ack or term the original.
+// headers (Trace-Id included) and adds the Dlq-* headers; the original
+// Nats-Msg-Id moves to Dlq-Original-Msg-Id. It does not ack or term the original.
 func (c *Consumer) deadLetter(ctx context.Context, sub subscription, msg jetstream.Msg, reason error) error {
 	hdr := nats.Header{}
 	for k, v := range msg.Headers() {
@@ -70,6 +74,9 @@ func (c *Consumer) deadLetter(ctx context.Context, sub subscription, msg jetstre
 	hdr.Set(DlqStreamHeader, sub.stream)
 	hdr.Set(DlqConsumerHeader, sub.durable)
 	hdr.Set(DlqSubjectHeader, msg.Subject())
+	if id := msg.Headers().Get(MsgIDHeader); id != "" {
+		hdr.Set(DlqMsgIDHeader, id)
+	}
 	if meta, err := msg.Metadata(); err == nil {
 		hdr.Set(DlqSequenceHeader, fmt.Sprintf("%d", meta.Sequence.Stream))
 		// One DLQ entry per original stream sequence, even if two pods race.

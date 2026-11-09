@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -15,10 +16,10 @@ import (
 )
 
 const (
-	DefaultConsumerGroupID      = "file-convert-group"
-	DefaultConsumerAckWait      = 30 * time.Second
-	DefaultConsumerMaxDeliver   = 5
-	DefaultConsumerRetryBackoff = 2 * time.Second
+	DefaultConsumerAckWait         = 30 * time.Second
+	DefaultConsumerMaxDeliver      = 5
+	DefaultConsumerRetryBackoff    = 2 * time.Second
+	DefaultConsumerMaxRetryBackoff = 60 * time.Second
 	// maxIteratorBackoff caps the wait between attempts to rebuild a failed
 	// message iterator (see consumeTopic).
 	maxIteratorBackoff = 30 * time.Second
@@ -28,12 +29,13 @@ const (
 // (durable JetStream consumer), mirroring go-kafka's Consumer API.
 //
 // Delivery semantics: at-least-once. When the handler returns nil the message
-// is acked; on error it is redelivered after RetryBackoff, up to MaxDeliver
-// attempts. On the last failed attempt the message is copied to the
-// dead-letter stream (see deadletter.go) and terminated, so nothing is dropped
-// silently. A handler panic is recovered and treated as a handler error.
-// Messages within a topic are processed serially, preserving stream order
-// (stronger than Kafka's per-partition ordering).
+// is acked; on error it is redelivered after a jittered exponential delay
+// (see retryDelay), up to MaxDeliver attempts. On the last failed attempt the
+// message is copied to the dead-letter stream (see deadletter.go) and
+// terminated, so nothing is dropped silently. A handler panic is recovered and
+// treated as a handler error. By default messages within a topic are processed
+// serially, preserving stream order (stronger than Kafka's per-partition
+// ordering); Concurrency > 1 trades that order for parallel handlers.
 type Consumer struct {
 	nc     *nats.Conn
 	js     jetstream.JetStream
@@ -157,15 +159,24 @@ func resolveSubscriptions(config *ConsumerConfig) ([]subscription, error) {
 
 // ConsumerConfig holds the configuration for consumers.
 type ConsumerConfig struct {
-	URLs             []string
-	GroupID          string   // durable consumer name (one per consuming service)
-	Topics           []string // legacy flat-subject topics; each topic is its own stream
-	AutoOffsetReset  string   // "earliest" (default) or "latest" — applies on first creation only
-	MaxDeliver       int      // max delivery attempts before the server stops redelivering
-	AckWait          time.Duration
-	RetryBackoff     time.Duration // Nak delay after a handler error
-	EnableAutoCommit bool          // kept for go-kafka API compat; acks are always explicit
-	Stream           StreamConfig  // used only when a stream does not exist yet
+	URLs            []string
+	GroupID         string   // durable consumer name (one per consuming service); required
+	Topics          []string // legacy flat-subject topics; each topic is its own stream
+	AutoOffsetReset string   // "earliest" (default) or "latest" — applies on first creation only
+	MaxDeliver      int      // max delivery attempts before the server stops redelivering
+	AckWait         time.Duration
+	RetryBackoff    time.Duration // base Nak delay after a handler error (doubles per delivery)
+	MaxRetryBackoff time.Duration // cap on the exponential Nak delay before jitter (default 60s)
+	// Concurrency is how many handlers may run at once per topic. 0 or 1
+	// (default) processes messages serially in stream order; N > 1 runs up to
+	// N handlers in parallel and gives up in-topic ordering.
+	Concurrency int
+	// MaxAckPending caps unacknowledged messages the server pushes to the
+	// durable. 0 defaults to Concurrency when Concurrency > 1, otherwise the
+	// server default (1000) applies.
+	MaxAckPending    int
+	EnableAutoCommit bool         // kept for go-kafka API compat; acks are always explicit
+	Stream           StreamConfig // used only when a stream does not exist yet
 	TLS              *TLSConfig
 	Auth             *AuthConfig
 	// InactiveThreshold instructs the NATS server to auto-delete a durable
@@ -173,8 +184,8 @@ type ConsumerConfig struct {
 	// Zero (default) preserves current behaviour: the server never
 	// auto-deletes the consumer.  Set to e.g. 24h for per-pod durables so
 	// that consumers left behind by pod restarts/deploys are cleaned up
-	// automatically.  This field is wired on first consumer creation only;
-	// existing durables are not updated (JetStream reuse path, line ~189).
+	// automatically.  An existing durable is updated to match (see
+	// ensureConsumer).
 	InactiveThreshold time.Duration
 	// Subscriptions adds app-scoped subscriptions (SubscribeApp /
 	// SubscribeAllApps); may be combined with Topics for other streams.
@@ -184,7 +195,8 @@ type ConsumerConfig struct {
 // NewConsumerConfigFromViper creates a consumer configuration from Viper.
 //
 // Keys: nats.urls, nats.consumer.{group_id,topics,auto_offset_reset,
-// max_deliver,ack_wait,retry_backoff,inactive_threshold}, nats.stream.*,
+// max_deliver,ack_wait,retry_backoff,max_retry_backoff,inactive_threshold,
+// concurrency,max_ack_pending}, nats.stream.*,
 // nats.tls.*, nats.auth.*
 func NewConsumerConfigFromViper() *ConsumerConfig {
 	config := &ConsumerConfig{
@@ -195,7 +207,10 @@ func NewConsumerConfigFromViper() *ConsumerConfig {
 		MaxDeliver:        viper.GetInt("nats.consumer.max_deliver"),
 		AckWait:           viper.GetDuration("nats.consumer.ack_wait"),
 		RetryBackoff:      viper.GetDuration("nats.consumer.retry_backoff"),
+		MaxRetryBackoff:   viper.GetDuration("nats.consumer.max_retry_backoff"),
 		InactiveThreshold: viper.GetDuration("nats.consumer.inactive_threshold"),
+		Concurrency:       viper.GetInt("nats.consumer.concurrency"),
+		MaxAckPending:     viper.GetInt("nats.consumer.max_ack_pending"),
 		Stream:            streamConfigFromViper(),
 		TLS:               tlsConfigFromViper(),
 		Auth:              authConfigFromViper(),
@@ -210,9 +225,6 @@ func applyConsumerDefaults(config *ConsumerConfig) {
 	if len(config.URLs) == 0 {
 		config.URLs = []string{DefaultURL}
 	}
-	if config.GroupID == "" {
-		config.GroupID = DefaultConsumerGroupID
-	}
 	if config.AutoOffsetReset == "" {
 		config.AutoOffsetReset = "earliest"
 	}
@@ -224,6 +236,15 @@ func applyConsumerDefaults(config *ConsumerConfig) {
 	}
 	if config.RetryBackoff == 0 {
 		config.RetryBackoff = DefaultConsumerRetryBackoff
+	}
+	if config.MaxRetryBackoff == 0 {
+		config.MaxRetryBackoff = DefaultConsumerMaxRetryBackoff
+	}
+	if config.Concurrency < 1 {
+		config.Concurrency = 1
+	}
+	if config.MaxAckPending == 0 && config.Concurrency > 1 {
+		config.MaxAckPending = config.Concurrency
 	}
 	applyStreamDefaults(&config.Stream)
 }
@@ -237,6 +258,9 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 		applyConsumerDefaults(config)
 	}
 
+	if config.GroupID == "" {
+		return nil, fmt.Errorf("consumer group ID is required (set ConsumerConfig.GroupID or nats.consumer.group_id)")
+	}
 	if len(config.Topics) == 0 && len(config.Subscriptions) == 0 {
 		return nil, fmt.Errorf("at least one topic is required")
 	}
@@ -388,25 +412,27 @@ func (c *Consumer) ConsumeMessages(ctx context.Context, handler func(*Message) e
 }
 
 // ensureConsumer makes sure the stream exists and returns the durable
-// consumer for sub, creating it on first use.
+// consumer for sub, creating it on first use. An existing durable is
+// reconciled: mutable settings (AckWait, MaxDeliver, InactiveThreshold,
+// MaxAckPending) are updated when they differ from config; immutable ones
+// (DeliverPolicy, FilterSubject) are left as they are and the difference
+// logged.
 func (c *Consumer) ensureConsumer(ctx context.Context, sub subscription) (jetstream.Consumer, error) {
 	if err := ensureStream(ctx, c.js, sub.topic, c.config.Stream, sub.scoped); err != nil {
 		return nil, err
 	}
 
-	// Reuse the existing durable if present — avoids update conflicts on
-	// immutable fields like DeliverPolicy.
-	cons, err := c.js.Consumer(ctx, sub.stream, sub.durable)
-	if err == nil {
-		return cons, nil
-	}
-	if !errors.Is(err, jetstream.ErrConsumerNotFound) {
-		return nil, fmt.Errorf("failed to look up consumer %q on stream %q: %w", sub.durable, sub.stream, err)
-	}
-
 	deliverPolicy := jetstream.DeliverAllPolicy
 	if c.config.AutoOffsetReset == "latest" {
 		deliverPolicy = jetstream.DeliverNewPolicy
+	}
+
+	cons, err := c.js.Consumer(ctx, sub.stream, sub.durable)
+	if err == nil {
+		return c.reconcileConsumer(ctx, sub, cons, deliverPolicy)
+	}
+	if !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		return nil, fmt.Errorf("failed to look up consumer %q on stream %q: %w", sub.durable, sub.stream, err)
 	}
 
 	cons, err = c.js.CreateConsumer(ctx, sub.stream, jetstream.ConsumerConfig{
@@ -417,11 +443,46 @@ func (c *Consumer) ensureConsumer(ctx context.Context, sub subscription) (jetstr
 		AckWait:           c.config.AckWait,
 		MaxDeliver:        c.config.MaxDeliver,
 		InactiveThreshold: c.config.InactiveThreshold,
+		MaxAckPending:     c.config.MaxAckPending,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create consumer %q on stream %q: %w", sub.durable, sub.stream, err)
 	}
 	return cons, nil
+}
+
+// reconcileConsumer updates an existing durable whose mutable settings drift
+// from config. MaxAckPending 0 in config means "server default" and is not
+// compared; MaxDeliver <= 0 on either side means unlimited.
+func (c *Consumer) reconcileConsumer(ctx context.Context, sub subscription, cons jetstream.Consumer, deliverPolicy jetstream.DeliverPolicy) (jetstream.Consumer, error) {
+	existing := cons.CachedInfo().Config
+	if existing.DeliverPolicy != deliverPolicy || existing.FilterSubject != sub.filter {
+		logPrintf("consumer %q on stream %q: deliver_policy=%v filter=%q differ from wanted %v/%q; immutable, leaving unchanged",
+			sub.durable, sub.stream, existing.DeliverPolicy, existing.FilterSubject, deliverPolicy, sub.filter)
+	}
+
+	want := existing
+	want.AckWait = c.config.AckWait
+	want.InactiveThreshold = c.config.InactiveThreshold
+	if !(existing.MaxDeliver <= 0 && c.config.MaxDeliver <= 0) {
+		want.MaxDeliver = c.config.MaxDeliver
+	}
+	if c.config.MaxAckPending > 0 {
+		want.MaxAckPending = c.config.MaxAckPending
+	}
+	if want.AckWait == existing.AckWait && want.MaxDeliver == existing.MaxDeliver &&
+		want.InactiveThreshold == existing.InactiveThreshold && want.MaxAckPending == existing.MaxAckPending {
+		return cons, nil
+	}
+
+	updated, err := c.js.UpdateConsumer(ctx, sub.stream, want)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update consumer %q on stream %q: %w", sub.durable, sub.stream, err)
+	}
+	logPrintf("consumer %q on stream %q updated: ack_wait %v->%v max_deliver %d->%d inactive_threshold %v->%v max_ack_pending %d->%d",
+		sub.durable, sub.stream, existing.AckWait, want.AckWait, existing.MaxDeliver, want.MaxDeliver,
+		existing.InactiveThreshold, want.InactiveThreshold, existing.MaxAckPending, want.MaxAckPending)
+	return updated, nil
 }
 
 // consumeTopic keeps one topic consuming until ctx is cancelled. A failed
@@ -466,9 +527,10 @@ func (c *Consumer) consumeTopic(ctx context.Context, sub subscription, cons jets
 	}
 }
 
-// consumeIterator runs the serial fetch/handle/ack loop for one topic over a
-// single message iterator. progressed reports whether at least one message
-// was fetched before the iterator failed.
+// consumeIterator runs the fetch/handle/ack loop for one topic over a single
+// message iterator: inline (serial) when Concurrency is 1, otherwise through a
+// semaphore of Concurrency workers. progressed reports whether at least one
+// message was fetched before the iterator failed.
 func (c *Consumer) consumeIterator(ctx context.Context, sub subscription, cons jetstream.Consumer, handler func(*Message) error) (progressed bool, retErr error) {
 	topic := sub.topic
 	it, err := cons.Messages()
@@ -504,9 +566,19 @@ func (c *Consumer) consumeIterator(ctx context.Context, sub subscription, cons j
 		}
 		it.Stop()
 	}()
-	// Deferred LIFO: close(done) runs first, then wait for the watcher.
+	// Deferred LIFO: in-flight workers finish first, then close(done), then
+	// wait for the watcher.
 	defer func() { <-stopped }()
 	defer close(done)
+
+	var (
+		sem     chan struct{} // nil: serial inline path
+		workers sync.WaitGroup
+	)
+	if c.config.Concurrency > 1 {
+		sem = make(chan struct{}, c.config.Concurrency)
+	}
+	defer workers.Wait()
 
 	for {
 		msg, err := it.Next()
@@ -521,29 +593,73 @@ func (c *Consumer) consumeIterator(ctx context.Context, sub subscription, cons j
 			c.setLoopErr(nil) // recovered
 		}
 
-		if err := c.safeHandle(topic, handler, toMessage(topic, msg)); err != nil {
-			if c.lastDelivery(msg) {
-				// Last attempt: park a copy on the dead-letter stream, then
-				// terminate so the server stops redelivering. If the DLQ
-				// publish fails, leave the message to the server (it is
-				// dropped after MaxDeliver either way) and log loudly.
-				if dlqErr := c.deadLetter(ctx, sub, msg, err); dlqErr != nil {
-					logPrintf("dead-letter publish failed topic=%q subject=%q msg_id=%q: %v (handler error: %v)",
-						topic, msg.Subject(), msg.Headers().Get(MsgIDHeader), dlqErr, err)
-					_ = msg.NakWithDelay(c.config.RetryBackoff)
-					continue
-				}
-				c.countDeadLetter(topic)
-				logPrintf("dead-lettered topic=%q subject=%q after %d deliveries: %v", topic, msg.Subject(), c.config.MaxDeliver, err)
-				_ = msg.Term()
-				continue
-			}
-			// Redeliver after backoff.
-			_ = msg.NakWithDelay(c.config.RetryBackoff)
+		if sem == nil {
+			c.handleMsg(ctx, sub, msg, handler)
 			continue
 		}
-		_ = msg.Ack()
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return progressed, nil // msg is redelivered after AckWait
+		}
+		workers.Add(1)
+		go func(msg jetstream.Msg) {
+			defer workers.Done()
+			defer func() { <-sem }()
+			c.handleMsg(ctx, sub, msg, handler)
+		}(msg)
 	}
+}
+
+// handleMsg runs handler on one message and acks, naks or dead-letters it.
+func (c *Consumer) handleMsg(ctx context.Context, sub subscription, msg jetstream.Msg, handler func(*Message) error) {
+	topic := sub.topic
+	err := c.safeHandle(topic, handler, toMessage(topic, msg))
+	if err == nil {
+		_ = msg.Ack()
+		return
+	}
+	if c.lastDelivery(msg) {
+		// Last attempt: park a copy on the dead-letter stream, then
+		// terminate so the server stops redelivering. If the DLQ
+		// publish fails, leave the message to the server (it is
+		// dropped after MaxDeliver either way) and log loudly.
+		if dlqErr := c.deadLetter(ctx, sub, msg, err); dlqErr != nil {
+			logPrintf("dead-letter publish failed topic=%q subject=%q msg_id=%q: %v (handler error: %v)",
+				topic, msg.Subject(), msg.Headers().Get(MsgIDHeader), dlqErr, err)
+			_ = msg.NakWithDelay(c.nakDelay(msg))
+			return
+		}
+		c.countDeadLetter(topic)
+		logPrintf("dead-lettered topic=%q subject=%q after %d deliveries: %v", topic, msg.Subject(), c.config.MaxDeliver, err)
+		_ = msg.Term()
+		return
+	}
+	// Redeliver after backoff.
+	_ = msg.NakWithDelay(c.nakDelay(msg))
+}
+
+// nakDelay is the redelivery delay for msg after a failed delivery.
+func (c *Consumer) nakDelay(msg jetstream.Msg) time.Duration {
+	var delivered uint64 = 1
+	if meta, err := msg.Metadata(); err == nil {
+		delivered = meta.NumDelivered
+	}
+	return retryDelay(c.config.RetryBackoff, c.config.MaxRetryBackoff, delivered)
+}
+
+// retryDelay returns min(base << (delivered-1), limit) scaled by a random factor
+// in [0.5, 1.5), so retries grow 2, 4, 8, 16 s (base 2s) without aligning
+// across messages.
+func retryDelay(base, limit time.Duration, delivered uint64) time.Duration {
+	d := base
+	for i := uint64(1); i < delivered && d < limit; i++ {
+		d *= 2
+	}
+	if d > limit || d <= 0 {
+		d = limit
+	}
+	return time.Duration(float64(d) * (0.5 + rand.Float64()))
 }
 
 // safeHandle invokes handler, converting a panic into an error so one poison
@@ -581,6 +697,7 @@ func toMessage(topic string, msg jetstream.Msg) *Message {
 		Value:   msg.Data(),
 		Subject: msg.Subject(),
 		AppID:   AppIDFromSubject(topic, msg.Subject()),
+		TraceID: msg.Headers().Get(TraceIDHeader),
 	}
 	if meta, err := msg.Metadata(); err == nil {
 		m.Offset = int64(meta.Sequence.Stream)

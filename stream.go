@@ -74,7 +74,11 @@ func replicasFromEnv() int {
 // deterministic:
 //   - Subjects: missing required subjects are ADDED (existing ones are never
 //     removed), so "<base>.*" is appended to a legacy single-subject stream.
-//     Adding is the only mutation this library ever makes to a stream.
+//   - Discard: RequestTopics streams are created with DiscardNew and an
+//     existing one with another policy is updated to DiscardNew. Other
+//     streams keep DiscardOld. Revert operationally with
+//     `nats stream edit <name> --discard old` (it is reapplied on the next
+//     service start unless the topic leaves RequestTopics).
 //   - Everything else (replicas, retention, limits) is TOLERATED: an existing
 //     stream keeps its configuration, and a replica mismatch is only logged.
 //     Scaling an existing stream is an operational step
@@ -90,6 +94,11 @@ func ensureStream(ctx context.Context, js jetstream.JetStream, topic string, cfg
 	name := StreamName(topic)
 	subjects := StreamSubjects(topic, requireScoped || IsAppScopedTopic(topic))
 
+	discard := jetstream.DiscardOld
+	if IsRequestTopic(topic) {
+		discard = jetstream.DiscardNew
+	}
+
 	stream, err := js.Stream(ctx, name)
 	if errors.Is(err, jetstream.ErrStreamNotFound) {
 		_, err = js.CreateStream(ctx, jetstream.StreamConfig{
@@ -97,7 +106,7 @@ func ensureStream(ctx context.Context, js jetstream.JetStream, topic string, cfg
 			Subjects:  subjects,
 			Storage:   jetstream.FileStorage,
 			Retention: jetstream.LimitsPolicy,
-			Discard:   jetstream.DiscardOld,
+			Discard:   discard,
 			MaxAge:    cfg.MaxAge,
 			MaxBytes:  cfg.MaxBytes,
 			Replicas:  cfg.Replicas,
@@ -119,6 +128,17 @@ func ensureStream(ctx context.Context, js jetstream.JetStream, topic string, cfg
 	if existing.Replicas != cfg.Replicas {
 		logPrintf("stream %q exists with replicas=%d, wanted %d; leaving it unchanged (scale it operationally)",
 			name, existing.Replicas, cfg.Replicas)
+	}
+
+	if discard == jetstream.DiscardNew && existing.Discard != discard {
+		updated := existing
+		updated.Discard = discard
+		if s, err := js.UpdateStream(ctx, updated); err != nil {
+			logPrintf("stream %q: failed to switch discard policy to new: %v", name, err)
+		} else {
+			existing = s.CachedInfo().Config
+			logPrintf("stream %q: discard policy set to new (request topic)", name)
+		}
 	}
 
 	missing := missingSubjects(existing.Subjects, subjects)

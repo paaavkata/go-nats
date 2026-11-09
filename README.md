@@ -18,8 +18,9 @@ mostly an import + config-key swap.
 
 Streams are created **idempotently** by both producers and consumers, so
 service startup order doesn't matter. Existing streams keep their
-configuration — externally managed configuration wins — with one exception:
-missing app-scoped subjects (`<base>.*`) are **added** (never removed). A
+configuration (externally managed configuration wins) with two exceptions:
+missing app-scoped subjects (`<base>.*`) are **added** (never removed), and
+request streams (`job`) are switched to `DiscardNew` (see v0.6.0 changes). A
 replica-count mismatch on an existing stream is **tolerated and logged**, never
 changed; scale existing streams operationally
 (`nats stream edit <name> --replicas 3`).
@@ -27,9 +28,46 @@ changed; scale existing streams operationally
 ## Delivery semantics
 
 At-least-once. Handler returns `nil` → ack. Handler returns error → redelivered
-after `RetryBackoff`, up to `MaxDeliver` attempts, then the server stops
-redelivering. Messages within one topic are processed serially (preserves
-order); different topics are consumed concurrently.
+after a jittered exponential delay, up to `MaxDeliver` attempts, then the
+message is dead-lettered. By default messages within one topic are processed
+serially (preserves order); different topics are consumed concurrently.
+
+## v0.6.0 changes
+
+- **Group ID required**: `NewConsumer` returns an error when `GroupID` is
+  empty. The old `file-convert-group` default (`DefaultConsumerGroupID`) is
+  removed, so two services can no longer share a durable by accident.
+- **Concurrency** (`ConsumerConfig.Concurrency`, `nats.consumer.concurrency`):
+  `0`/`1` (default) keeps the serial inline loop. `N > 1` runs up to N handlers
+  at once per topic, each message acked or naked on its own; in-topic order is
+  then not guaranteed, so keep `1` for consumers that need it.
+  `MaxAckPending` (`nats.consumer.max_ack_pending`) defaults to `Concurrency`
+  when `Concurrency > 1`, otherwise the server default (1000) applies.
+- **Durable reconciliation**: at start an existing durable whose `AckWait`,
+  `MaxDeliver`, `InactiveThreshold` or `MaxAckPending` differs from config is
+  updated (`UpdateConsumer`). Immutable settings (`DeliverPolicy`,
+  `FilterSubject`) are never changed; a mismatch is only logged. A
+  `MaxAckPending` of 0 in config is not compared.
+- **Backoff**: the Nak delay is `min(RetryBackoff << (NumDelivered-1),
+  MaxRetryBackoff) * U(0.5, 1.5)`. With the defaults (2s base, 60s cap) failed
+  deliveries 1, 2, 3, 4, 5 wait about 2, 4, 8, 16, 32 s (each between half and
+  one and a half times that), so time to dead-letter with `MaxDeliver` 5 is
+  about 30 s instead of 8 s. Lower `RetryBackoff` for faster retries.
+- **Request streams discard new**: streams for `RequestTopics` (`job`) are
+  created with `DiscardNew`, and an existing one with another policy is
+  updated. A full `job` stream now rejects the publish with an error instead
+  of silently evicting the oldest unprocessed request. Operator revert:
+  `nats stream edit job --discard old` (reapplied on the next service start
+  while `job` stays in `RequestTopics`, so a lasting revert needs a library
+  change).
+- **Trace id**: a publish copies `ctx.Value("trace_id")` (the key go-server's
+  request-id middleware sets) into the `Trace-Id` header. Consumers read it as
+  `Message.TraceID`; `msg.Context(ctx)` returns ctx carrying it under
+  `"trace_id"` so go-logger `*Ctx` calls log it. No trace id in ctx means no
+  header and a context without one.
+- **Dead-letter copies** keep all original headers including `Trace-Id`; the
+  original `Nats-Msg-Id` moves to `Dlq-Original-Msg-Id` because the copy uses
+  its own dedup id.
 
 ## Resilience (v0.5.0)
 
@@ -79,12 +117,16 @@ standard `log` package unless `gonats.SetLogger(logger.Infof)` is called.
 - `nats.producer.timeout`: publish ack timeout (default: `5s`)
 
 ### Consumer
-- `nats.consumer.group_id`: durable consumer name (default: `file-convert-group`)
+- `nats.consumer.group_id`: durable consumer name (required, no default)
 - `nats.consumer.topics`: list of topics to consume
 - `nats.consumer.auto_offset_reset`: `earliest` (default) or `latest` — applies on first creation only
 - `nats.consumer.max_deliver`: max delivery attempts (default: 5)
 - `nats.consumer.ack_wait`: redelivery timeout for unacked messages (default: `30s`)
-- `nats.consumer.retry_backoff`: delay before redelivery after handler error (default: `2s`)
+- `nats.consumer.retry_backoff`: base delay before redelivery after handler error, doubled per delivery and jittered (default: `2s`)
+- `nats.consumer.max_retry_backoff`: cap on that delay before jitter (default: `60s`)
+- `nats.consumer.concurrency`: handlers running at once per topic (default: `1`, serial)
+- `nats.consumer.max_ack_pending`: server-side cap on unacked messages (default: `concurrency` when > 1, else server default)
+- `nats.consumer.inactive_threshold`: auto-delete an idle durable after this long (default: never)
 
 ## Usage
 
@@ -116,7 +158,7 @@ if err != nil { ... }
 defer consumer.Close()
 
 err = consumer.ConsumeMessages(ctx, func(msg *gonats.Message) error {
-    // return nil to ack; return error to redeliver after RetryBackoff
+    // return nil to ack; return error to redeliver after the backoff
     return process(msg.Value)
 })
 ```
