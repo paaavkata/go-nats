@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func TestApplyProducerDefaults(t *testing.T) {
@@ -127,5 +129,39 @@ func TestMessageContextCarriesTraceID(t *testing.T) {
 	}
 	if got := (&Message{}).Context(context.Background()).Value("trace_id"); got != nil {
 		t.Fatalf("trace_id = %v, want none", got)
+	}
+}
+
+func TestAuthOptionFromEnv(t *testing.T) {
+	apply := func(o nats.Option) nats.Options {
+		var opts nats.Options
+		if o != nil {
+			_ = o(&opts)
+		}
+		return opts
+	}
+	t.Setenv("NATS_CREDS_FILE", "")
+	t.Setenv("NATS_TOKEN", "")
+	t.Setenv("NATS_USER", "")
+	t.Setenv("NATS_PASSWORD", "")
+	if authOption(nil) != nil {
+		t.Fatal("expected no auth option with empty env")
+	}
+
+	t.Setenv("NATS_USER", "cms-service")
+	t.Setenv("NATS_PASSWORD", "pw")
+	if o := apply(authOption(nil)); o.User != "cms-service" || o.Password != "pw" {
+		t.Fatalf("user/password not applied: %q", o.User)
+	}
+	if o := apply(authOption(&AuthConfig{})); o.User != "cms-service" {
+		t.Fatal("empty AuthConfig should fall back to env")
+	}
+	if o := apply(authOption(&AuthConfig{Username: "explicit", Password: "x"})); o.User != "explicit" {
+		t.Fatal("explicit AuthConfig must win over env")
+	}
+
+	t.Setenv("NATS_TOKEN", "tok")
+	if o := apply(authOption(nil)); o.Token != "tok" || o.User != "" {
+		t.Fatal("token should win over user/password")
 	}
 }

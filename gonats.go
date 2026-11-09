@@ -171,6 +171,45 @@ func authConfigFromViper() *AuthConfig {
 	return auth
 }
 
+// AuthConfigFromEnv reads NATS credentials from the environment:
+// NATS_CREDS_FILE, then NATS_TOKEN, then NATS_USER/NATS_PASSWORD. It returns
+// nil when none is set.
+func AuthConfigFromEnv() *AuthConfig {
+	auth := &AuthConfig{
+		Username:  os.Getenv("NATS_USER"),
+		Password:  os.Getenv("NATS_PASSWORD"),
+		Token:     os.Getenv("NATS_TOKEN"),
+		CredsFile: os.Getenv("NATS_CREDS_FILE"),
+	}
+	if auth.empty() {
+		return nil
+	}
+	return auth
+}
+
+func (a *AuthConfig) empty() bool {
+	return a == nil || (a.Username == "" && a.Token == "" && a.CredsFile == "")
+}
+
+// authOption picks the connect option for auth. An empty auth falls back to
+// AuthConfigFromEnv, so services only need NATS_USER/NATS_PASSWORD in env.
+func authOption(auth *AuthConfig) nats.Option {
+	if auth.empty() {
+		auth = AuthConfigFromEnv()
+	}
+	if auth == nil {
+		return nil
+	}
+	switch {
+	case auth.CredsFile != "":
+		return nats.UserCredentials(auth.CredsFile)
+	case auth.Token != "":
+		return nats.Token(auth.Token)
+	default:
+		return nats.UserInfo(auth.Username, auth.Password)
+	}
+}
+
 // connect establishes a NATS connection with sane reconnect behaviour.
 func connect(urls []string, clientName string, tlsCfg *TLSConfig, auth *AuthConfig) (*nats.Conn, error) {
 	if len(urls) == 0 {
@@ -192,15 +231,8 @@ func connect(urls []string, clientName string, tlsCfg *TLSConfig, auth *AuthConf
 		opts = append(opts, nats.Secure(stdTLS))
 	}
 
-	if auth != nil {
-		switch {
-		case auth.CredsFile != "":
-			opts = append(opts, nats.UserCredentials(auth.CredsFile))
-		case auth.Token != "":
-			opts = append(opts, nats.Token(auth.Token))
-		case auth.Username != "":
-			opts = append(opts, nats.UserInfo(auth.Username, auth.Password))
-		}
+	if opt := authOption(auth); opt != nil {
+		opts = append(opts, opt)
 	}
 
 	nc, err := nats.Connect(strings.Join(urls, ","), opts...)

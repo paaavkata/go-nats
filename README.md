@@ -100,6 +100,12 @@ serially (preserves order); different topics are consumed concurrently.
 - `nats.client_id`: connection name shown in NATS monitoring
 - `nats.tls.enabled|ca_file|cert_file|key_file|insecure_skip_verify`
 - `nats.auth.username|password|token|creds_file`
+- Environment fallback (since v0.7.0): when the caller passes no `Auth` (or an
+  empty one), `connect` reads `NATS_CREDS_FILE`, then `NATS_TOKEN`, then
+  `NATS_USER`/`NATS_PASSWORD`. Platform services set `NATS_USER=<service>` in
+  `envVars` and `NATS_PASSWORD` in `secretEnvVars` from the namespace's
+  `nats-credentials` SealedSecret; no code change is needed. `AuthConfigFromEnv()`
+  exposes the same lookup.
 
 ### Stream creation (used only when a stream doesn't exist yet)
 - `nats.stream.max_age`: retention window (default: `168h`)
