@@ -542,15 +542,6 @@ func (c *Consumer) consumeIterator(ctx context.Context, sub subscription, cons j
 	// heartbeat (2026-11-02). Messages() succeeds even while disconnected
 	// (nats.go buffers the subscribe), so prove the server is reachable and
 	// the durable exists with an Info round-trip before reporting healthy.
-	if c.Healthy(ctx) != nil {
-		infoCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, infoErr := cons.Info(infoCtx)
-		cancel()
-		if infoErr == nil {
-			c.setLoopErr(nil) // recovered
-		}
-	}
-
 	// Unblock it.Next() when the context is cancelled. `done` lets the watcher
 	// exit when the loop returns on its own (iterator error): before this, the
 	// deferred <-stopped waited for a ctx cancel that ConsumeMessages only
@@ -558,6 +549,12 @@ func (c *Consumer) consumeIterator(ctx context.Context, sub subscription, cons j
 	// goroutine forever and the pod stayed Ready with no consumer.
 	stopped := make(chan struct{})
 	done := make(chan struct{})
+	// One Info attempt was not enough: when the rebuild raced a JetStream
+	// quorum loss (2026-11-09 WireGuard cutover) Info failed once and idle
+	// pods stayed unready for good. Keep probing until the server answers.
+	if c.Healthy(ctx) != nil && !c.probeInfo(ctx, cons) {
+		go c.probeUntilHealthy(ctx, done, cons)
+	}
 	go func() {
 		defer close(stopped)
 		select {
@@ -704,4 +701,34 @@ func toMessage(topic string, msg jetstream.Msg) *Message {
 		m.Timestamp = meta.Timestamp
 	}
 	return m
+}
+
+// probeInfo clears loopErr when a consumer Info round-trip succeeds.
+func (c *Consumer) probeInfo(ctx context.Context, cons jetstream.Consumer) bool {
+	infoCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, err := cons.Info(infoCtx); err != nil {
+		return false
+	}
+	c.setLoopErr(nil) // recovered
+	return true
+}
+
+// probeUntilHealthy retries probeInfo every RetryBackoff until it succeeds,
+// the iterator loop ends (done) or ctx is cancelled.
+func (c *Consumer) probeUntilHealthy(ctx context.Context, done <-chan struct{}, cons jetstream.Consumer) {
+	t := time.NewTicker(c.config.RetryBackoff)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-t.C:
+			if c.Healthy(ctx) == nil || c.probeInfo(ctx, cons) {
+				return
+			}
+		}
+	}
 }

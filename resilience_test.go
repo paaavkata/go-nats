@@ -46,7 +46,14 @@ func (f *fakeIterator) Drain()                            {}
 type fakeConsumer struct {
 	jetstream.Consumer // nil: any other method panics, which a test would surface
 	it                 *fakeIterator
+	mu                 sync.Mutex
 	infoErr            error // Info result; nil = reachable
+}
+
+func (f *fakeConsumer) setInfoErr(err error) {
+	f.mu.Lock()
+	f.infoErr = err
+	f.mu.Unlock()
 }
 
 func (f *fakeConsumer) Messages(...jetstream.PullMessagesOpt) (jetstream.MessagesContext, error) {
@@ -54,8 +61,11 @@ func (f *fakeConsumer) Messages(...jetstream.PullMessagesOpt) (jetstream.Message
 }
 
 func (f *fakeConsumer) Info(context.Context) (*jetstream.ConsumerInfo, error) {
-	if f.infoErr != nil {
-		return nil, f.infoErr
+	f.mu.Lock()
+	err := f.infoErr
+	f.mu.Unlock()
+	if err != nil {
+		return nil, err
 	}
 	return &jetstream.ConsumerInfo{}, nil
 }
@@ -83,7 +93,7 @@ func TestHealthyClearsOnRebuiltIdleIterator(t *testing.T) {
 			if c.Healthy(ctx) == nil {
 				t.Error("Healthy cleared while Info still fails")
 			}
-			fc.infoErr = nil
+			fc.setInfoErr(nil)
 			return nil, errors.New("nats: no heartbeat received")
 		default: // rebuilt with server back, topic idle: block like a real Next
 			healthyAfterRebuild <- c.Healthy(ctx)
@@ -599,5 +609,52 @@ func TestIntegrationTraceIDRoundTripAndDLQ(t *testing.T) {
 	}
 	if h := dlq[0].Header; h.Get(TraceIDHeader) != "trace-abc" || h.Get(DlqMsgIDHeader) != "mid-1" {
 		t.Fatalf("dlq headers Trace-Id=%q Dlq-Original-Msg-Id=%q, want trace-abc/mid-1", h.Get(TraceIDHeader), h.Get(DlqMsgIDHeader))
+	}
+}
+
+// The rebuild's single Info probe raced a JetStream quorum loss (2026-11-09
+// WireGuard cutover): Info failed once, the topic stayed idle and four prod
+// pods were unready until deleted. The probe must keep retrying while the
+// iterator blocks, and clear Healthy once the server answers.
+func TestHealthyClearsWhenInfoRecoversOnIdleIterator(t *testing.T) {
+	c := &Consumer{config: &ConsumerConfig{}}
+	applyConsumerDefaults(c.config)
+	c.config.RetryBackoff = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sub := subscription{topic: "t", stream: "t", durable: "g"}
+	fc := &fakeConsumer{infoErr: errors.New("nats: no servers available")}
+	rebuilt := make(chan struct{})
+	var calls int
+	fc.it = &fakeIterator{next: func() (jetstream.Msg, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("nats: no heartbeat received")
+		}
+		close(rebuilt) // Info still failing here; topic idle from now on
+		<-ctx.Done()
+		return nil, jetstream.ErrMsgIteratorClosed
+	}}
+	done := make(chan error, 1)
+	go func() { done <- c.consumeTopic(ctx, sub, fc, func(*Message) error { return nil }) }()
+	select {
+	case <-rebuilt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("iterator never rebuilt")
+	}
+	if c.Healthy(ctx) == nil {
+		t.Fatal("Healthy cleared while Info still fails")
+	}
+	fc.setInfoErr(nil) // server back, no message will ever flow
+	deadline := time.Now().Add(2 * time.Second)
+	for c.Healthy(ctx) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Healthy still reports an error after Info recovered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("consumeTopic after ctx cancel = %v, want nil", err)
 	}
 }
